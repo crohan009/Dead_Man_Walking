@@ -4,6 +4,19 @@ import cv2
 import pylab
 import os
 import sys
+from scipy import signal
+from scipy.stats import entropy
+
+# Parameters for lucas kanade optical flow
+lk_params = dict( winSize  = (15,15),
+                  maxLevel = 2,
+                  criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+
+# params for ShiTomasi corner detection
+feature_params = dict( maxCorners = 100,
+                       qualityLevel = 0.3,
+                       minDistance = 7,
+                       blockSize = 7 )
 
 
 def resource_path(relative_path):
@@ -27,24 +40,29 @@ class findFaceGetPulse(object):
         self.fps = 0
         self.buffer_size = 250
         #self.window = np.hamming(self.buffer_size)
-        self.data_buffer = []
+        self.data_buffer_pr = []    # pulse-rate buffer
+        self.data_buffer_rr = []    # respiration-rate buffer
         self.times = []
         self.ttimes = []
         self.samples = []
         self.freqs = []
         self.fft = []
+        self.fft_rr = []
         self.slices = [[0]]
         self.t0 = time.time()
         self.bpms = []
         self.bpm = 0
+        self.rr  = 0
         dpath = resource_path("haarcascade_frontalface_alt.xml")
         if not os.path.exists(dpath):
             print("Cascade file not present!")
         self.face_cascade = cv2.CascadeClassifier(dpath)
 
         self.face_rect = [1, 1, 2, 2]
+        self.forehead = [0, 0, 0, 0]
         self.last_center = np.array([0, 0])
         self.last_wh = np.array([0, 0])
+        self.face_features = None
         self.output_dim = 13
         self.trained = False
 
@@ -91,7 +109,7 @@ class findFaceGetPulse(object):
         return self.trained
 
     def plot(self):
-        data = np.array(self.data_buffer).T
+        data = np.array(self.data_buffer_pr).T
         np.savetxt("data.dat", data)
         np.savetxt("times.dat", self.times)
         freqs = 60. * self.freqs
@@ -131,7 +149,7 @@ class findFaceGetPulse(object):
                        (10, 50), cv2.FONT_HERSHEY_PLAIN, 1.25, col)
             cv2.putText(self.frame_out, "Press 'Esc' to quit",
                        (10, 75), cv2.FONT_HERSHEY_PLAIN, 1.25, col)
-            self.data_buffer, self.times, self.trained = [], [], False
+            self.data_buffer_pr, self.times, self.trained = [], [], False
             detected = list(self.face_cascade.detectMultiScale(self.gray,
                                                                scaleFactor=1.3,
                                                                minNeighbors=4,
@@ -144,15 +162,17 @@ class findFaceGetPulse(object):
 
                 if self.shift(detected[-1]) > 10:
                     self.face_rect = detected[-1]
-            forehead1 = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
+            self.forehead = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
+
             self.draw_rect(self.face_rect, col=(255, 0, 0))
             x, y, w, h = self.face_rect
             cv2.putText(self.frame_out, "Face",
                        (x, y), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
-            self.draw_rect(forehead1)
-            x, y, w, h = forehead1
+            self.draw_rect(self.forehead)
+            x, y, w, h = self.forehead
             cv2.putText(self.frame_out, "Forehead",
                        (x, y), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
+            self.face_features = cv2.goodFeaturesToTrack(self.gray[y:y+h, x:x+w], mask = None, **feature_params)
             return
         if set(self.face_rect) == set([1, 1, 2, 2]):
             return
@@ -168,25 +188,49 @@ class findFaceGetPulse(object):
         cv2.putText(self.frame_out, "Press 'Esc' to quit",
                    (10, 100), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
 
-        forehead1 = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
-        self.draw_rect(forehead1)
+        curr_forehead = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
+        self.draw_rect(curr_forehead)
 
-        vals = self.get_subface_means(forehead1)
+        # Get mean RBG space value
+        vals = self.get_subface_means(curr_forehead)
+        self.data_buffer_pr.append(vals)
 
-        self.data_buffer.append(vals)
-        L = len(self.data_buffer)
+        x, y, w, h = self.forehead
+        x_c, y_c, w_c, h_c = curr_forehead
+        prev = self.gray[y:y+h, x:x+w]
+        next = self.gray[y_c:y_c+h_c, x_c:x_c+w_c]
+
+        next_face_features, st, err = cv2.calcOpticalFlowPyrLK(prev, next, self.face_features, None, **lk_params)
+
+        # Select good points
+        good_new = next_face_features[st==1]
+        good_old = self.face_features[st==1]
+
+        self.data_buffer_rr.append( good_new[:,1] - good_old[:,1] )
+
+        # Now update the previous frame and previous points
+        self.forehead = curr_forehead
+        self.face_features = good_new.reshape(-1,1,2)
+
+        L = len(self.data_buffer_pr)
         if L > self.buffer_size:
-            self.data_buffer = self.data_buffer[-self.buffer_size:]
+            self.data_buffer_pr = self.data_buffer_pr[-self.buffer_size:]
+            self.data_buffer_rr = self.data_buffer_rr[-self.buffer_size:]
             self.times = self.times[-self.buffer_size:]
             L = self.buffer_size
 
-        processed = np.array(self.data_buffer)
+        vert_flow = np.array(self.data_buffer_rr)
+        # print("vert_flow.shape = {}".format(vert_flow.shape))
+
+        processed = np.array(self.data_buffer_pr)
         self.samples = processed
+
         if L > 10:
             self.output_dim = processed.shape[0]
 
             self.fps = float(L) / (self.times[-1] - self.times[0])
             even_times = np.linspace(self.times[0], self.times[-1], L)
+
             interpolated = np.interp(even_times, self.times, processed)
             interpolated = np.hamming(L) * interpolated
             interpolated = interpolated - np.mean(interpolated)
@@ -205,6 +249,34 @@ class findFaceGetPulse(object):
             self.freqs = pfreq
             self.fft = pruned
             idx2 = np.argmax(pruned)
+
+            interpolated_rr = np.zeros( (L , vert_flow.shape[1]) )
+            for i in range(vert_flow.shape[1]):
+                interpolated_rr[:,i] = np.interp(even_times, self.times, vert_flow[:,i])
+
+            vert_flow = interpolated_rr
+
+            sos = signal.butter(5, [0.2, 0.45], 'bandpass', fs=self.fps, output='sos')
+            vert_flow = signal.sosfilt(sos, vert_flow, axis=0)      # filter vert_flow to a 12 Hz - 42 Hz range
+
+            vert_flow_mu  = np.mean(vert_flow, axis=0)
+            vert_flow_cov = np.matmul( (vert_flow-vert_flow_mu).T, (vert_flow-vert_flow_mu) )
+
+            eig_values, eig_vectors = np.linalg.eig(vert_flow_cov)      # SVD of vert_flow covariance matrix
+            vert_flow_pca = np.matmul(vert_flow, eig_vectors[:, :5])    # transform data using first 5 principal components
+
+            self.fft_rr = np.abs( np.fft.rfft(vert_flow_pca, axis=0) )
+            # idx3 = np.argmax(self.fft_rr, axis=0)
+
+            # candidate_freqs = self.freqs[ idx3 ]
+            f, Pxx_den = signal.welch(vert_flow_pca, self.fps, nperseg=L, axis=0)  # compute PSD of signal FFTs
+            entropies = entropy(Pxx_den)
+            idx4 = np.argmin(entropies)                                 # select component with minimal entropy
+
+            self.rr = self.freqs[ np.argmax( self.fft_rr[:,idx4] ) ]
+
+            # self.rr = self.freqs[ idx3[idx4] ]
+            # print("RR = {}".format(self.rr))
 
             t = (np.sin(phase[idx2]) + 1.) / 2.
             t = 0.9 * t + 0.1
@@ -232,7 +304,7 @@ class findFaceGetPulse(object):
             if gap:
                 text = "(estimate: %0.1f bpm, wait %0.0f s)" % (self.bpm, gap)
             else:
-                text = "(estimate: %0.1f bpm)" % (self.bpm)
+                text = "(estimate: %0.1f bpm, %0.1f rr)" % (self.bpm, self.rr)
             tsize = 1
             cv2.putText(self.frame_out, text,
                        (int(x - w / 2), int(y)), cv2.FONT_HERSHEY_PLAIN, tsize, col)
